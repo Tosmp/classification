@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
 
 BatchNorm2d = nn.BatchNorm2d
 bn_mom = 0.1
@@ -89,14 +90,14 @@ class Bottleneck(nn.Module):
             return self.relu(out)
 
 
-class DualResNet(nn.Module):
+class DualResNetAttn(nn.Module):
 
     def __init__(self, block, layers, num_classes=1000, planes=64, last_planes=2048):
-        super(DualResNet, self).__init__()
-        print(planes)
+        super(DualResNetAttn, self).__init__()
 
         #self.inplanes = 64
         #fuse_planes = 128
+
         highres_planes = planes * 2
         self.last_planes = last_planes
 
@@ -109,11 +110,16 @@ class DualResNet(nn.Module):
                           nn.ReLU(inplace=True),
                       )
 
+
         self.relu = nn.ReLU(inplace=False)
         self.layer1 = self._make_layer(block, planes, planes, layers[0])
         self.layer2 = self._make_layer(block, planes, planes * 2, layers[1], stride=2)
         self.layer3 = self._make_layer(block, planes * 2, planes * 4, layers[2], stride=2)
         self.layer4 = self._make_layer(block, planes * 4, planes * 8, layers[3], stride=2)
+        
+        self.attn3 = self.make_attn_layer(planes*4, planes*2, 1)
+        self.attn4 = self.make_attn_layer(planes*8, planes*2, 1)
+        self.attn5 = self.make_attn_layer(planes*8*2, planes*2, 1)
 
         self.compression3 = nn.Sequential(
                                           nn.Conv2d(planes * 4, highres_planes, kernel_size=1, bias=False),
@@ -169,6 +175,27 @@ class DualResNet(nn.Module):
             elif isinstance(m, BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+                
+    def make_attn_layer(self, in_ch, bot_ch, out_ch, inner=True, drop=False):
+
+        od = OrderedDict([('conv0', nn.Conv2d(in_ch, bot_ch, kernel_size=3,
+                                              padding=1, bias=False)),
+                          ('bn0', BatchNorm2d(bot_ch)),
+                          ('re0', nn.ReLU(inplace=True))])
+        if inner:
+            od['conv1'] = nn.Conv2d(bot_ch, bot_ch, kernel_size=3, padding=1,
+                                    bias=False)
+            od['bn1'] = BatchNorm2d(bot_ch)
+            od['re1'] = nn.ReLU(inplace=True)
+        if drop:
+            od['drop'] = nn.Dropout(0.5)
+
+        od['conv2'] = nn.Conv2d(bot_ch, out_ch, kernel_size=1, bias=False)
+        od['sig'] = nn.Sigmoid()
+
+        attn_head = nn.Sequential(od)
+        
+        return attn_head
 
 
     def _make_layer(self, block, inplanes, planes, blocks, stride=1):
@@ -209,24 +236,58 @@ class DualResNet(nn.Module):
         x = self.layer3(self.relu(x))
         layers.append(x)
         x_ = self.layer3_(self.relu(layers[1]))
-
+        
+        
+        #  ----- confusion ----- x側にattention x = xigmoid(x), x_ = (1-x) をattentionで作成
+        #layer3 = 1/16
+        #layer3_ = 1/8
+        
+        attn = self.attn3(x)
+        x = x * attn
+        x_ = x_ * (1 - F.interpolate(attn, 
+                                     size=[x_.shape[-2], x_.shape[-1]],
+                                     mode='bilinear',
+                                     align_corners=True))
+        
         x = x + self.down3(self.relu(x_))
         x_ = x_ + F.interpolate(
                         self.compression3(self.relu(layers[2])),
                         size=[height_output, width_output],
-                        mode='bilinear')
+                        mode='bilinear', 
+                        align_corners=True)
 
         x = self.layer4(self.relu(x))
         layers.append(x)
         x_ = self.layer4_(self.relu(x_))
-
+        
+        
+        #  ----- confusion -----
+        attn = self.attn4(x)
+        x = x * attn
+        x_ = x_ * (1 - F.interpolate(attn, 
+                                     size=[x_.shape[-2], x_.shape[-1]],
+                                     mode='bilinear',
+                                     align_corners=True))
+        
         x = x + self.down4(self.relu(x_))
         x_ = x_ + F.interpolate(
                         self.compression4(self.relu(layers[3])),
                         size=[height_output, width_output],
-                        mode='bilinear')
+                        mode='bilinear',
+                        align_corners=True)
 
-        x = self.layer5(self.relu(x))+ self.down5(self.relu(self.layer5_(self.relu(x_))))
+        
+        x = self.layer5(self.relu(x))
+        x_ = self.down5(self.relu(self.layer5_(self.relu(x_))))
+        
+        #  ----- confusion -----
+        attn = self.attn5(x)
+        x = x * attn
+        x_ = x_ * (1 - F.interpolate(attn, 
+                                     size=[x_.shape[-2], x_.shape[-1]],
+                                     mode='bilinear',
+                                     align_corners=True))
+        x = x + x_
 
         x = self.last_layer(self.relu(x))
         x = x.view(-1, self.last_planes)
@@ -234,7 +295,7 @@ class DualResNet(nn.Module):
         return x
 
 def get_model():
-    return DualResNet(block=BasicBlock, layers=[2, 2, 2, 2], planes=32, last_planes=1024)
+    return DualResNetAttn(block=BasicBlock, layers=[2, 2, 2, 2], planes=32, last_planes=1024)
 
 
 
